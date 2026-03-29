@@ -2,8 +2,7 @@
 
 CLI tool for making movies easier to hear by adding a balanced stereo track optimized for lower-volume playback.
 
-This project is based on the work shared by Reddit user `smernt` in the r/PleX thread:
-https://www.reddit.com/r/PleX/comments/9rc7sp/thought_id_share_some_ffmpeg_scripts_i_made_to/
+This project is based on the work shared by Reddit user `smernt` in the [r/PleX thread](https://www.reddit.com/r/PleX/comments/9rc7sp/thought_id_share_some_ffmpeg_scripts_i_made_to/).
 
 The goal here is to make that workflow easier to use as a simple command-line tool.
 
@@ -23,6 +22,32 @@ ffmpeg -version
 ```
 
 If that command fails, install FFmpeg first, then run `drc_encode` again.
+
+## Installation
+
+Make the script executable:
+
+```bash
+chmod +x drc_encode
+```
+
+You can run it from the project directory:
+
+```bash
+./drc_encode movie.mkv
+```
+
+Or move it somewhere in your `PATH` so you can run it from anywhere:
+
+```bash
+mv drc_encode /usr/local/bin/drc_encode
+```
+
+Then run it like this:
+
+```bash
+drc_encode movie.mkv
+```
 
 ## Usage
 
