@@ -1,0 +1,68 @@
+#!/bin/bash
+
+set -euo pipefail
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  echo "Usage: drc_encode <input-file> [language-code]" >&2
+  exit 1
+fi
+
+input="$1"
+lang="${2:-}"
+
+if [[ ! -f "$input" ]]; then
+  echo "Input file not found: $input" >&2
+  exit 1
+fi
+
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "ffmpeg is required but was not found in PATH." >&2
+  exit 1
+fi
+
+base="${input%.*}"
+ext="${input##*.}"
+output="${base}_Stereo_DRC.${ext}"
+
+title="2.0 Stereo DRC"
+if [[ -n "$lang" ]]; then
+  title="${lang} ${title}"
+fi
+
+cmd=(ffmpeg -y -i "$input")
+
+# Preserve video and subtitle streams when present.
+cmd+=(-map '0:v?' -c:v copy)
+cmd+=(-map '0:s?' -c:s copy)
+
+# Keep all original audio tracks and prepend a DRC stereo encode of the first track.
+cmd+=(-map '0:a:0?' -map '0:a?' -c:a copy)
+cmd+=(
+  -c:a:0 aac
+  -ac:a:0 2
+  -filter:a:0 "acompressor=ratio=8:threshold=-30dB:makeup=9dB,loudnorm,volume=8dB"
+  -ar:a:0 48000
+  -b:a:0 192k
+  -metadata:s:a:0 title="$title"
+)
+
+if [[ -n "$lang" ]]; then
+  cmd+=(-metadata:s:a:0 language="$lang")
+fi
+
+cmd+=("$output")
+
+if "${cmd[@]}"; then
+  echo "Success. Deleting original file: $input"
+  rm "$input"
+
+  srt_input="${base}.srt"
+  srt_output="${base}_Stereo_DRC.srt"
+  if [[ -f "$srt_input" ]]; then
+    echo "Renaming subtitle: $srt_input -> $srt_output"
+    mv "$srt_input" "$srt_output"
+  fi
+else
+  echo "FFmpeg failed. Input file not deleted." >&2
+  exit 1
+fi
