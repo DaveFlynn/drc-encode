@@ -3,12 +3,7 @@
 set -euo pipefail
 
 DEFAULT_PROFILE="stereo-drc"
-PROFILE_CODEC="aac"
-PROFILE_CHANNELS="2"
-PROFILE_FILTER="acompressor=ratio=8:threshold=-30dB:makeup=9dB,loudnorm,volume=8dB"
-PROFILE_SAMPLE_RATE="48000"
-PROFILE_BITRATE="192k"
-PROFILE_TITLE_SUFFIX="Stereo DRC"
+SUPPORTED_PROFILES="stereo-drc, stereo, nightmode"
 
 usage() {
   cat >&2 <<'EOF'
@@ -18,7 +13,15 @@ Options:
   --interactive, -i       Show detected audio streams and prompt for selection
   --tracks <list>         Audio tracks to encode, using displayed numbers (example: 1,2)
   --profile <profile>     Encode profile to use (default: stereo-drc)
+  --reorder-audio [order] Reorder existing audio tracks (example: 2,4,3,1)
+  --remove-audio [list]   Remove existing audio tracks (example: 2 or 2,4)
+  --keep-original         Keep the original input file after a successful encode
   --help, -h              Show this help
+
+Profiles:
+  stereo-drc              Opinionated low-volume DRC profile
+  stereo                  Plain AAC stereo downmix
+  nightmode               Center-channel-focused surround mixdown
 
 The optional language-code positional argument is kept for backward compatibility.
 When omitted, generated tracks inherit language metadata from their source audio stream.
@@ -32,6 +35,41 @@ die() {
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "$1 is required but was not found in PATH."
+}
+
+set_profile_settings() {
+  case "$profile" in
+    stereo-drc)
+      PROFILE_CODEC="aac"
+      PROFILE_CHANNELS="2"
+      PROFILE_FILTER="acompressor=ratio=8:threshold=-30dB:makeup=9dB,loudnorm,volume=8dB"
+      PROFILE_SAMPLE_RATE="48000"
+      PROFILE_BITRATE="192k"
+      PROFILE_TITLE_SUFFIX="Stereo DRC"
+      PROFILE_FILE_SUFFIX="Stereo_DRC"
+      ;;
+    stereo)
+      PROFILE_CODEC="aac"
+      PROFILE_CHANNELS="2"
+      PROFILE_FILTER=""
+      PROFILE_SAMPLE_RATE=""
+      PROFILE_BITRATE="192k"
+      PROFILE_TITLE_SUFFIX="Stereo"
+      PROFILE_FILE_SUFFIX="Stereo"
+      ;;
+    nightmode)
+      PROFILE_CODEC="aac"
+      PROFILE_CHANNELS="2"
+      PROFILE_FILTER="pan=stereo|FL=FC+0.30*FL+0.30*FLC+0.30*BL+0.30*SL+0.60*LFE|FR=FC+0.30*FR+0.30*FRC+0.30*BR+0.30*SR+0.60*LFE"
+      PROFILE_SAMPLE_RATE=""
+      PROFILE_BITRATE="192k"
+      PROFILE_TITLE_SUFFIX="NightMode"
+      PROFILE_FILE_SUFFIX="NightMode"
+      ;;
+    *)
+      die "Unsupported profile: $profile. Supported profiles: $SUPPORTED_PROFILES"
+      ;;
+  esac
 }
 
 language_name() {
@@ -53,6 +91,13 @@ language_name() {
   esac
 }
 
+is_surround_track() {
+  local source_index="$1"
+  local channel_count="${audio_channel_counts[$source_index]}"
+
+  [[ "$channel_count" =~ ^[0-9]+$ ]] && ((channel_count > 2))
+}
+
 append_unique_track() {
   local track="$1"
   local existing
@@ -64,6 +109,19 @@ append_unique_track() {
   fi
 
   selected_tracks+=("$track")
+}
+
+append_unique_parsed_track() {
+  local track="$1"
+  local existing
+
+  if ((${#parsed_tracks[@]} > 0)); then
+    for existing in "${parsed_tracks[@]}"; do
+      [[ "$existing" == "$track" ]] && die "Duplicate track selection: $((track + 1))"
+    done
+  fi
+
+  parsed_tracks+=("$track")
 }
 
 parse_tracks() {
@@ -86,6 +144,34 @@ parse_tracks() {
     track_index=$((track_number - 1))
     append_unique_track "$track_index"
   done
+}
+
+parse_audio_list() {
+  local value="$1"
+  local require_all="$2"
+  local context="$3"
+  local item
+  local track_number
+  local track_index
+
+  parsed_tracks=()
+  value="${value//[[:space:]]/}"
+  [[ -n "$value" ]] || die "$context cannot be empty."
+
+  IFS=',' read -r -a requested_tracks <<<"$value"
+  for item in "${requested_tracks[@]}"; do
+    [[ "$item" =~ ^[0-9]+$ ]] || die "Invalid track selection: $item"
+
+    track_number="$item"
+    ((track_number >= 1 && track_number <= audio_count)) || die "Track $track_number is out of range."
+
+    track_index=$((track_number - 1))
+    append_unique_parsed_track "$track_index"
+  done
+
+  if [[ "$require_all" == true && "${#parsed_tracks[@]}" -ne "$audio_count" ]]; then
+    die "$context must include every audio track exactly once."
+  fi
 }
 
 display_audio_streams() {
@@ -119,10 +205,96 @@ prompt_for_tracks() {
 
   display_audio_streams
   echo
-  printf 'Select audio tracks to encode with %s, in output order [1]: ' "$profile"
+  if [[ "$profile_provided" == true ]]; then
+    printf 'Select audio tracks to encode with %s, in output order [1]: ' "$profile"
+  else
+    printf 'Select audio tracks to process, in output order [1]: '
+  fi
   read -r response
   echo
   parse_tracks "$response"
+}
+
+selected_tracks_support_nightmode() {
+  local source_index
+
+  for source_index in "${selected_tracks[@]}"; do
+    if ! is_surround_track "$source_index"; then
+      return 1
+    fi
+  done
+
+  return 0
+}
+
+append_compatible_profiles() {
+  compatible_profiles=(stereo-drc stereo)
+
+  if selected_tracks_support_nightmode; then
+    compatible_profiles+=(nightmode)
+  fi
+}
+
+prompt_for_profile() {
+  local response
+  local i
+  local profile_index
+
+  append_compatible_profiles
+
+  echo "Available profiles for selected tracks:"
+  for ((i = 0; i < ${#compatible_profiles[@]}; i++)); do
+    printf '%d. %s\n' "$((i + 1))" "${compatible_profiles[$i]}"
+  done
+
+  echo
+  printf 'Select profile [%s]: ' "$DEFAULT_PROFILE"
+  read -r response
+  echo
+
+  response="${response//[[:space:]]/}"
+  if [[ -z "$response" ]]; then
+    profile="$DEFAULT_PROFILE"
+    return
+  fi
+
+  if [[ "$response" =~ ^[0-9]+$ ]]; then
+    profile_index=$((response - 1))
+    ((profile_index >= 0 && profile_index < ${#compatible_profiles[@]})) || die "Profile selection is out of range."
+    profile="${compatible_profiles[$profile_index]}"
+    return
+  fi
+
+  for ((i = 0; i < ${#compatible_profiles[@]}; i++)); do
+    if [[ "$response" == "${compatible_profiles[$i]}" ]]; then
+      profile="$response"
+      return
+    fi
+  done
+
+  die "Profile '$response' is not compatible with the selected tracks."
+}
+
+prompt_for_reorder_audio() {
+  local response
+
+  display_audio_streams
+  echo
+  printf 'Enter new audio track order, including every track once: '
+  read -r response
+  echo
+  parse_audio_list "$response" true "Audio reorder"
+}
+
+prompt_for_remove_audio() {
+  local response
+
+  display_audio_streams
+  echo
+  printf 'Enter audio tracks to remove: '
+  read -r response
+  echo
+  parse_audio_list "$response" false "Audio removal"
 }
 
 derive_generated_title() {
@@ -145,11 +317,32 @@ derive_generated_title() {
   echo "2.0 ${PROFILE_TITLE_SUFFIX}"
 }
 
+validate_profile_for_tracks() {
+  local source_index
+  local track_number
+
+  if [[ "$profile" != "nightmode" ]]; then
+    return
+  fi
+
+  for source_index in "${selected_tracks[@]}"; do
+    if ! is_surround_track "$source_index"; then
+      track_number=$((source_index + 1))
+      die "Profile nightmode requires a surround source, but track $track_number is ${audio_channels[$source_index]}."
+    fi
+  done
+}
+
 input=""
 legacy_lang=""
 interactive=false
 tracks_arg=""
 profile="$DEFAULT_PROFILE"
+profile_provided=false
+keep_original=false
+audio_operation=""
+reorder_arg=""
+remove_arg=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -165,7 +358,32 @@ while [[ $# -gt 0 ]]; do
     --profile)
       [[ $# -ge 2 ]] || die "--profile requires a profile name."
       profile="$2"
+      profile_provided=true
       shift 2
+      ;;
+    --reorder-audio)
+      [[ -z "$audio_operation" ]] || die "--reorder-audio cannot be combined with --remove-audio."
+      audio_operation="reorder"
+      if [[ $# -ge 2 && "$2" != --* ]]; then
+        reorder_arg="$2"
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    --remove-audio)
+      [[ -z "$audio_operation" ]] || die "--remove-audio cannot be combined with --reorder-audio."
+      audio_operation="remove"
+      if [[ $# -ge 2 && "$2" != --* ]]; then
+        remove_arg="$2"
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    --keep-original)
+      keep_original=true
+      shift
       ;;
     --help|-h)
       usage
@@ -192,8 +410,13 @@ done
   exit 1
 }
 
-[[ "$profile" == "$DEFAULT_PROFILE" ]] || die "Unsupported profile: $profile"
 [[ -f "$input" ]] || die "Input file not found: $input"
+
+if [[ -n "$audio_operation" ]]; then
+  [[ -z "$tracks_arg" ]] || die "--tracks cannot be combined with audio management operations."
+  [[ "$profile_provided" == false ]] || die "--profile cannot be combined with audio management operations."
+  [[ -z "$legacy_lang" ]] || die "language-code cannot be combined with audio management operations."
+fi
 
 require_command ffmpeg
 require_command ffprobe
@@ -201,7 +424,6 @@ require_command jq
 
 base="${input%.*}"
 ext="${input##*.}"
-output="${base}_Stereo_DRC.${ext}"
 
 probe_json="$(ffprobe -v error \
   -select_streams a \
@@ -221,6 +443,9 @@ while IFS= read -r value; do audio_codecs+=("$value"); done < <(jq -r '.streams[
 audio_channels=()
 while IFS= read -r value; do audio_channels+=("$value"); done < <(jq -r '.streams[] | if (.channel_layout // "") != "" then .channel_layout elif (.channels // "") != "" then ((.channels | tostring) + "ch") else "unknown" end' <<<"$probe_json")
 
+audio_channel_counts=()
+while IFS= read -r value; do audio_channel_counts+=("$value"); done < <(jq -r '.streams[] | .channels // 0' <<<"$probe_json")
+
 audio_titles=()
 while IFS= read -r value; do audio_titles+=("$value"); done < <(jq -r '.streams[] | .tags.title // ""' <<<"$probe_json")
 
@@ -233,6 +458,64 @@ while IFS= read -r value; do audio_forced+=("$value"); done < <(jq -r '.streams[
 audio_count="${#audio_global_indexes[@]}"
 ((audio_count > 0)) || die "No audio streams were found in: $input"
 
+if [[ "$audio_operation" == "reorder" ]]; then
+  OUTPUT_FILE_SUFFIX="Audio_Reordered"
+  output="${base}_${OUTPUT_FILE_SUFFIX}.${ext}"
+
+  if [[ -n "$reorder_arg" ]]; then
+    parse_audio_list "$reorder_arg" true "Audio reorder"
+  else
+    prompt_for_reorder_audio
+  fi
+
+  cmd=(ffmpeg -y -i "$input")
+  cmd+=(-map '0:v?' -c:v copy)
+
+  for source_index in "${parsed_tracks[@]}"; do
+    cmd+=(-map "0:a:$source_index")
+  done
+
+  cmd+=(-map '0:s?' -c:s copy)
+
+  for output_audio_index in "${!parsed_tracks[@]}"; do
+    cmd+=("-c:a:$output_audio_index" copy)
+  done
+
+  cmd+=("$output")
+elif [[ "$audio_operation" == "remove" ]]; then
+  OUTPUT_FILE_SUFFIX="Audio_Removed"
+  output="${base}_${OUTPUT_FILE_SUFFIX}.${ext}"
+
+  if [[ -n "$remove_arg" ]]; then
+    parse_audio_list "$remove_arg" false "Audio removal"
+  else
+    prompt_for_remove_audio
+  fi
+
+  ((${#parsed_tracks[@]} < audio_count)) || die "Audio removal cannot remove every audio track."
+
+  cmd=(ffmpeg -y -i "$input")
+  cmd+=(-map '0:v?' -c:v copy)
+
+  output_audio_index=0
+  for ((source_index = 0; source_index < audio_count; source_index++)); do
+    remove_track=false
+    for removed_index in "${parsed_tracks[@]}"; do
+      if [[ "$removed_index" == "$source_index" ]]; then
+        remove_track=true
+        break
+      fi
+    done
+
+    if [[ "$remove_track" == false ]]; then
+      cmd+=(-map "0:a:$source_index" "-c:a:$output_audio_index" copy)
+      output_audio_index=$((output_audio_index + 1))
+    fi
+  done
+
+  cmd+=(-map '0:s?' -c:s copy)
+  cmd+=("$output")
+else
 selected_tracks=()
 if [[ -n "$tracks_arg" ]]; then
   parse_tracks "$tracks_arg"
@@ -241,6 +524,16 @@ elif [[ "$interactive" == true ]]; then
 else
   selected_tracks=(0)
 fi
+
+if [[ "$interactive" == true && "$profile_provided" == false ]]; then
+  prompt_for_profile
+fi
+
+set_profile_settings
+OUTPUT_FILE_SUFFIX="$PROFILE_FILE_SUFFIX"
+output="${base}_${OUTPUT_FILE_SUFFIX}.${ext}"
+
+validate_profile_for_tracks
 
 generated_langs=()
 for source_index in "${selected_tracks[@]}"; do
@@ -267,12 +560,18 @@ for output_audio_index in "${!selected_tracks[@]}"; do
   cmd+=(
     "-c:a:$output_audio_index" "$PROFILE_CODEC"
     "-ac:a:$output_audio_index" "$PROFILE_CHANNELS"
-    "-filter:a:$output_audio_index" "$PROFILE_FILTER"
-    "-ar:a:$output_audio_index" "$PROFILE_SAMPLE_RATE"
     "-b:a:$output_audio_index" "$PROFILE_BITRATE"
     "-metadata:s:a:$output_audio_index" "language=$generated_lang"
     "-metadata:s:a:$output_audio_index" "title=$generated_title"
   )
+
+  if [[ -n "$PROFILE_FILTER" ]]; then
+    cmd+=("-filter:a:$output_audio_index" "$PROFILE_FILTER")
+  fi
+
+  if [[ -n "$PROFILE_SAMPLE_RATE" ]]; then
+    cmd+=("-ar:a:$output_audio_index" "$PROFILE_SAMPLE_RATE")
+  fi
 done
 
 for ((original_audio_index = 0; original_audio_index < audio_count; original_audio_index++)); do
@@ -281,16 +580,26 @@ for ((original_audio_index = 0; original_audio_index < audio_count; original_aud
 done
 
 cmd+=("$output")
+fi
 
 if "${cmd[@]}"; then
-  echo "Success. Deleting original file: $input"
-  rm "$input"
+  if [[ "$keep_original" == true ]]; then
+    echo "Success. Original file kept: $input"
+  else
+    echo "Success. Deleting original file: $input"
+    rm "$input"
+  fi
 
   srt_input="${base}.srt"
-  srt_output="${base}_Stereo_DRC.srt"
+  srt_output="${base}_${OUTPUT_FILE_SUFFIX}.srt"
   if [[ -f "$srt_input" ]]; then
-    echo "Renaming subtitle: $srt_input -> $srt_output"
-    mv "$srt_input" "$srt_output"
+    if [[ "$keep_original" == true ]]; then
+      echo "Copying subtitle: $srt_input -> $srt_output"
+      cp "$srt_input" "$srt_output"
+    else
+      echo "Renaming subtitle: $srt_input -> $srt_output"
+      mv "$srt_input" "$srt_output"
+    fi
   fi
 else
   echo "FFmpeg failed. Input file not deleted." >&2
