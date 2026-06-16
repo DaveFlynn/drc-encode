@@ -13,6 +13,8 @@ This tool exists because movies with 5.1 or 7.1 audio are often difficult to use
 ## Requirements
 
 - `ffmpeg` must be installed and available in your `PATH`
+- `ffprobe` must be installed and available in your `PATH`
+- `jq` must be installed and available in your `PATH`
 - macOS, Linux, or another environment that can run Bash and FFmpeg
 
 Check that FFmpeg is installed:
@@ -21,7 +23,13 @@ Check that FFmpeg is installed:
 ffmpeg -version
 ```
 
-If that command fails, install FFmpeg first, then run `drc_encode` again.
+Check that `jq` is installed:
+
+```bash
+jq --version
+```
+
+If either command fails, install the missing dependency first, then run `drc_encode` again.
 
 ## Installation
 
@@ -54,20 +62,30 @@ drc_encode movie.mkv
 Run the script directly:
 
 ```bash
-./drc_encode <input-file> [language-code]
+./drc_encode <input-file> [language-code] [options]
 ```
 
 Examples:
 
 ```bash
 ./drc_encode movie.mkv
-./drc_encode movie.mkv eng
+./drc_encode movie.mkv --interactive
+./drc_encode movie.mkv --tracks 2,1 --profile stereo-drc
 ```
+
+Options:
+
+- `--interactive`, `-i`: show detected audio streams and prompt for which tracks to encode
+- `--tracks <list>`: encode selected audio tracks using the displayed 1-based track numbers, for example `--tracks 1,2`
+- `--profile <profile>`: choose the encode profile; currently only `stereo-drc` is supported
+- `[language-code]`: optional legacy override for the generated track language metadata
 
 ## What It Does
 
-- Creates a new stereo AAC track from the first audio stream
+- Creates new stereo AAC tracks from the selected source audio streams
 - Raises quieter parts of the soundtrack and evens out volume swings so dialogue is easier to hear and loud scenes are less jarring
+- Places generated tracks before the original audio tracks
+- Preserves language metadata on generated tracks when the source stream has it
 - Copies existing video streams
 - Copies existing audio streams
 - Copies existing subtitle streams
@@ -80,6 +98,6 @@ If encoding succeeds:
 
 ## Notes
 
-- The optional `language-code` is written to the new DRC audio track metadata
-- If no language code is provided, the new track is titled `2.0 Stereo DRC`
-- If a language code is provided, the new track is titled `<language-code> 2.0 Stereo DRC`
+- If no options are provided, the first audio stream is encoded with the default `stereo-drc` profile
+- Generated track titles are derived from the source title or language when available
+- The optional `language-code` argument is kept for backward compatibility, but normal usage should rely on source stream metadata

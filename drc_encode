@@ -2,53 +2,283 @@
 
 set -euo pipefail
 
-if [[ $# -lt 1 || $# -gt 2 ]]; then
-  echo "Usage: drc_encode <input-file> [language-code]" >&2
-  exit 1
-fi
+DEFAULT_PROFILE="stereo-drc"
+PROFILE_CODEC="aac"
+PROFILE_CHANNELS="2"
+PROFILE_FILTER="acompressor=ratio=8:threshold=-30dB:makeup=9dB,loudnorm,volume=8dB"
+PROFILE_SAMPLE_RATE="48000"
+PROFILE_BITRATE="192k"
+PROFILE_TITLE_SUFFIX="Stereo DRC"
 
-input="$1"
-lang="${2:-}"
+usage() {
+  cat >&2 <<'EOF'
+Usage: drc_encode <input-file> [language-code] [options]
 
-if [[ ! -f "$input" ]]; then
-  echo "Input file not found: $input" >&2
-  exit 1
-fi
+Options:
+  --interactive, -i       Show detected audio streams and prompt for selection
+  --tracks <list>         Audio tracks to encode, using displayed numbers (example: 1,2)
+  --profile <profile>     Encode profile to use (default: stereo-drc)
+  --help, -h              Show this help
 
-if ! command -v ffmpeg >/dev/null 2>&1; then
-  echo "ffmpeg is required but was not found in PATH." >&2
+The optional language-code positional argument is kept for backward compatibility.
+When omitted, generated tracks inherit language metadata from their source audio stream.
+EOF
+}
+
+die() {
+  echo "Error: $*" >&2
   exit 1
-fi
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "$1 is required but was not found in PATH."
+}
+
+language_name() {
+  case "$1" in
+    eng) echo "English" ;;
+    jpn) echo "Japanese" ;;
+    spa) echo "Spanish" ;;
+    fre|fra) echo "French" ;;
+    ger|deu) echo "German" ;;
+    ita) echo "Italian" ;;
+    por) echo "Portuguese" ;;
+    kor) echo "Korean" ;;
+    chi|zho) echo "Chinese" ;;
+    cmn) echo "Mandarin" ;;
+    yue) echo "Cantonese" ;;
+    rus) echo "Russian" ;;
+    und|"") echo "" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+append_unique_track() {
+  local track="$1"
+  local existing
+
+  if ((${#selected_tracks[@]} > 0)); then
+    for existing in "${selected_tracks[@]}"; do
+      [[ "$existing" == "$track" ]] && die "Duplicate track selection: $((track + 1))"
+    done
+  fi
+
+  selected_tracks+=("$track")
+}
+
+parse_tracks() {
+  local value="$1"
+  local item
+  local track_number
+  local track_index
+
+  selected_tracks=()
+  value="${value//[[:space:]]/}"
+  [[ -n "$value" ]] || value="1"
+
+  IFS=',' read -r -a requested_tracks <<<"$value"
+  for item in "${requested_tracks[@]}"; do
+    [[ "$item" =~ ^[0-9]+$ ]] || die "Invalid track selection: $item"
+
+    track_number="$item"
+    ((track_number >= 1 && track_number <= audio_count)) || die "Track $track_number is out of range."
+
+    track_index=$((track_number - 1))
+    append_unique_track "$track_index"
+  done
+}
+
+display_audio_streams() {
+  local i
+  local flags
+  local title
+
+  echo "Detected audio streams:"
+  for ((i = 0; i < audio_count; i++)); do
+    flags=""
+    [[ "${audio_defaults[$i]}" == "1" ]] && flags="default"
+    [[ "${audio_forced[$i]}" == "1" ]] && flags="${flags:+$flags,}forced"
+    [[ -n "$flags" ]] || flags="-"
+
+    title="${audio_titles[$i]}"
+    [[ -n "$title" ]] && title="\"$title\"" || title="-"
+
+    printf '%d. a:%d  %s  %s  %s  %s  %s\n' \
+      "$((i + 1))" \
+      "$i" \
+      "${audio_langs[$i]}" \
+      "${audio_codecs[$i]}" \
+      "${audio_channels[$i]}" \
+      "$flags" \
+      "$title"
+  done
+}
+
+prompt_for_tracks() {
+  local response
+
+  display_audio_streams
+  echo
+  printf 'Select audio tracks to encode with %s, in output order [1]: ' "$profile"
+  read -r response
+  echo
+  parse_tracks "$response"
+}
+
+derive_generated_title() {
+  local source_index="$1"
+  local source_title="${audio_titles[$source_index]}"
+  local source_lang="${generated_langs[$source_index]}"
+  local lang_label
+
+  if [[ -n "$source_title" ]]; then
+    echo "${source_title} ${PROFILE_TITLE_SUFFIX}"
+    return
+  fi
+
+  lang_label="$(language_name "$source_lang")"
+  if [[ -n "$lang_label" ]]; then
+    echo "${lang_label} ${PROFILE_TITLE_SUFFIX}"
+    return
+  fi
+
+  echo "2.0 ${PROFILE_TITLE_SUFFIX}"
+}
+
+input=""
+legacy_lang=""
+interactive=false
+tracks_arg=""
+profile="$DEFAULT_PROFILE"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --interactive|-i)
+      interactive=true
+      shift
+      ;;
+    --tracks)
+      [[ $# -ge 2 ]] || die "--tracks requires a comma-separated list."
+      tracks_arg="$2"
+      shift 2
+      ;;
+    --profile)
+      [[ $# -ge 2 ]] || die "--profile requires a profile name."
+      profile="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --*)
+      die "Unknown option: $1"
+      ;;
+    *)
+      if [[ -z "$input" ]]; then
+        input="$1"
+      elif [[ -z "$legacy_lang" ]]; then
+        legacy_lang="$1"
+      else
+        die "Unexpected argument: $1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+[[ -n "$input" ]] || {
+  usage
+  exit 1
+}
+
+[[ "$profile" == "$DEFAULT_PROFILE" ]] || die "Unsupported profile: $profile"
+[[ -f "$input" ]] || die "Input file not found: $input"
+
+require_command ffmpeg
+require_command ffprobe
+require_command jq
 
 base="${input%.*}"
 ext="${input##*.}"
 output="${base}_Stereo_DRC.${ext}"
 
-title="2.0 Stereo DRC"
-if [[ -n "$lang" ]]; then
-  title="${lang} ${title}"
+probe_json="$(ffprobe -v error \
+  -select_streams a \
+  -show_entries stream=index,codec_name,channels,channel_layout:stream_tags=language,title:stream_disposition=default,forced \
+  -of json \
+  "$input")"
+
+audio_global_indexes=()
+while IFS= read -r value; do audio_global_indexes+=("$value"); done < <(jq -r '.streams[] | .index' <<<"$probe_json")
+
+audio_langs=()
+while IFS= read -r value; do audio_langs+=("$value"); done < <(jq -r '.streams[] | .tags.language // "und"' <<<"$probe_json")
+
+audio_codecs=()
+while IFS= read -r value; do audio_codecs+=("$value"); done < <(jq -r '.streams[] | .codec_name // "unknown"' <<<"$probe_json")
+
+audio_channels=()
+while IFS= read -r value; do audio_channels+=("$value"); done < <(jq -r '.streams[] | if (.channel_layout // "") != "" then .channel_layout elif (.channels // "") != "" then ((.channels | tostring) + "ch") else "unknown" end' <<<"$probe_json")
+
+audio_titles=()
+while IFS= read -r value; do audio_titles+=("$value"); done < <(jq -r '.streams[] | .tags.title // ""' <<<"$probe_json")
+
+audio_defaults=()
+while IFS= read -r value; do audio_defaults+=("$value"); done < <(jq -r '.streams[] | .disposition.default // 0' <<<"$probe_json")
+
+audio_forced=()
+while IFS= read -r value; do audio_forced+=("$value"); done < <(jq -r '.streams[] | .disposition.forced // 0' <<<"$probe_json")
+
+audio_count="${#audio_global_indexes[@]}"
+((audio_count > 0)) || die "No audio streams were found in: $input"
+
+selected_tracks=()
+if [[ -n "$tracks_arg" ]]; then
+  parse_tracks "$tracks_arg"
+elif [[ "$interactive" == true ]]; then
+  prompt_for_tracks
+else
+  selected_tracks=(0)
 fi
+
+generated_langs=()
+for source_index in "${selected_tracks[@]}"; do
+  generated_langs[$source_index]="${legacy_lang:-${audio_langs[$source_index]}}"
+  [[ -n "${generated_langs[$source_index]}" ]] || generated_langs[$source_index]="und"
+done
 
 cmd=(ffmpeg -y -i "$input")
 
-# Preserve video and subtitle streams when present.
+# Preserve video streams, then prepend generated audio before original audio.
 cmd+=(-map '0:v?' -c:v copy)
-cmd+=(-map '0:s?' -c:s copy)
 
-# Keep all original audio tracks and prepend a DRC stereo encode of the first track.
-cmd+=(-map '0:a:0?' -map '0:a?' -c:a copy)
-cmd+=(
-  -c:a:0 aac
-  -ac:a:0 2
-  -filter:a:0 "acompressor=ratio=8:threshold=-30dB:makeup=9dB,loudnorm,volume=8dB"
-  -ar:a:0 48000
-  -b:a:0 192k
-  -metadata:s:a:0 title="$title"
-)
+for source_index in "${selected_tracks[@]}"; do
+  cmd+=(-map "0:a:$source_index")
+done
 
-if [[ -n "$lang" ]]; then
-  cmd+=(-metadata:s:a:0 language="$lang")
-fi
+cmd+=(-map '0:a?' -map '0:s?' -c:s copy)
+
+for output_audio_index in "${!selected_tracks[@]}"; do
+  source_index="${selected_tracks[$output_audio_index]}"
+  generated_lang="${generated_langs[$source_index]}"
+  generated_title="$(derive_generated_title "$source_index")"
+
+  cmd+=(
+    "-c:a:$output_audio_index" "$PROFILE_CODEC"
+    "-ac:a:$output_audio_index" "$PROFILE_CHANNELS"
+    "-filter:a:$output_audio_index" "$PROFILE_FILTER"
+    "-ar:a:$output_audio_index" "$PROFILE_SAMPLE_RATE"
+    "-b:a:$output_audio_index" "$PROFILE_BITRATE"
+    "-metadata:s:a:$output_audio_index" "language=$generated_lang"
+    "-metadata:s:a:$output_audio_index" "title=$generated_title"
+  )
+done
+
+for ((original_audio_index = 0; original_audio_index < audio_count; original_audio_index++)); do
+  output_audio_index=$((${#selected_tracks[@]} + original_audio_index))
+  cmd+=("-c:a:$output_audio_index" copy)
+done
 
 cmd+=("$output")
 
