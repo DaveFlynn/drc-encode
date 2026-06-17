@@ -15,6 +15,7 @@ Options:
   --profile <profile>     Encode profile to use (default: stereo-drc)
   --reorder-audio [order] Reorder existing audio tracks (example: 2,4,3,1)
   --remove-audio [list]   Remove existing audio tracks (example: 2 or 2,4)
+  --tag-audio <spec>      Rewrite audio metadata (example: 2:title=Commentary,language=eng)
   --keep-original         Keep the original input file after a successful encode
   --help, -h              Show this help
 
@@ -122,6 +123,77 @@ append_unique_parsed_track() {
   fi
 
   parsed_tracks+=("$track")
+}
+
+tag_track_indexes=()
+tag_titles=()
+tag_languages=()
+
+append_tag_override() {
+  local track_index="$1"
+  local tag_title="$2"
+  local tag_language="$3"
+  local i
+
+  for ((i = 0; i < ${#tag_track_indexes[@]}; i++)); do
+    if [[ "${tag_track_indexes[$i]}" == "$track_index" ]]; then
+      [[ -n "$tag_title" ]] && tag_titles[$i]="$tag_title"
+      [[ -n "$tag_language" ]] && tag_languages[$i]="$tag_language"
+      return
+    fi
+  done
+
+  tag_track_indexes+=("$track_index")
+  tag_titles+=("$tag_title")
+  tag_languages+=("$tag_language")
+}
+
+parse_tag_spec() {
+  local spec="$1"
+  local track_part
+  local fields_part
+  local track_number
+  local track_index
+  local field
+  local key
+  local value
+  local title=""
+  local language=""
+
+  [[ "$spec" == *:* ]] || die "Invalid --tag-audio spec: $spec"
+
+  track_part="${spec%%:*}"
+  fields_part="${spec#*:}"
+
+  [[ "$track_part" =~ ^[0-9]+$ ]] || die "Invalid audio track in --tag-audio spec: $spec"
+
+  track_number="$track_part"
+  ((track_number >= 1 && track_number <= audio_count)) || die "Track $track_number is out of range in --tag-audio spec."
+  track_index=$((track_number - 1))
+
+  IFS=',' read -r -a requested_fields <<<"$fields_part"
+  for field in "${requested_fields[@]}"; do
+    [[ "$field" == *=* ]] || die "Invalid field in --tag-audio spec: $field"
+    key="${field%%=*}"
+    value="${field#*=}"
+
+    case "$key" in
+      title)
+        [[ -n "$value" ]] || die "title cannot be empty in --tag-audio spec."
+        title="$value"
+        ;;
+      language)
+        [[ -n "$value" ]] || die "language cannot be empty in --tag-audio spec."
+        language="$value"
+        ;;
+      *)
+        die "Unsupported --tag-audio field: $key"
+        ;;
+    esac
+  done
+
+  [[ -n "$title" || -n "$language" ]] || die "--tag-audio must set at least one field."
+  append_tag_override "$track_index" "$title" "$language"
 }
 
 parse_tracks() {
@@ -343,6 +415,7 @@ keep_original=false
 audio_operation=""
 reorder_arg=""
 remove_arg=""
+tag_specs=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -381,6 +454,11 @@ while [[ $# -gt 0 ]]; do
         shift
       fi
       ;;
+    --tag-audio)
+      [[ $# -ge 2 ]] || die "--tag-audio requires a spec."
+      tag_specs+=("$2")
+      shift 2
+      ;;
     --keep-original)
       keep_original=true
       shift
@@ -416,6 +494,12 @@ if [[ -n "$audio_operation" ]]; then
   [[ -z "$tracks_arg" ]] || die "--tracks cannot be combined with audio management operations."
   [[ "$profile_provided" == false ]] || die "--profile cannot be combined with audio management operations."
   [[ -z "$legacy_lang" ]] || die "language-code cannot be combined with audio management operations."
+fi
+
+if ((${#tag_specs[@]} > 0)); then
+  [[ -z "$tracks_arg" ]] || die "--tracks cannot be combined with --tag-audio."
+  [[ "$profile_provided" == false ]] || die "--profile cannot be combined with --tag-audio."
+  [[ -z "$legacy_lang" ]] || die "language-code cannot be combined with --tag-audio."
 fi
 
 require_command ffmpeg
@@ -458,6 +542,12 @@ while IFS= read -r value; do audio_forced+=("$value"); done < <(jq -r '.streams[
 audio_count="${#audio_global_indexes[@]}"
 ((audio_count > 0)) || die "No audio streams were found in: $input"
 
+if ((${#tag_specs[@]} > 0)); then
+  for tag_spec in "${tag_specs[@]}"; do
+    parse_tag_spec "$tag_spec"
+  done
+fi
+
 if [[ "$audio_operation" == "reorder" ]]; then
   OUTPUT_FILE_SUFFIX="Audio_Reordered"
   output="${base}_${OUTPUT_FILE_SUFFIX}.${ext}"
@@ -471,7 +561,9 @@ if [[ "$audio_operation" == "reorder" ]]; then
   cmd=(ffmpeg -y -i "$input")
   cmd+=(-map '0:v?' -c:v copy)
 
+  final_audio_sources=()
   for source_index in "${parsed_tracks[@]}"; do
+    final_audio_sources+=("$source_index")
     cmd+=(-map "0:a:$source_index")
   done
 
@@ -479,6 +571,16 @@ if [[ "$audio_operation" == "reorder" ]]; then
 
   for output_audio_index in "${!parsed_tracks[@]}"; do
     cmd+=("-c:a:$output_audio_index" copy)
+  done
+
+  for ((tag_index = 0; tag_index < ${#tag_track_indexes[@]}; tag_index++)); do
+    tagged_source="${tag_track_indexes[$tag_index]}"
+    for ((output_audio_index = 0; output_audio_index < ${#final_audio_sources[@]}; output_audio_index++)); do
+      if [[ "${final_audio_sources[$output_audio_index]}" == "$tagged_source" ]]; then
+        [[ -n "${tag_titles[$tag_index]}" ]] && cmd+=("-metadata:s:a:$output_audio_index" "title=${tag_titles[$tag_index]}")
+        [[ -n "${tag_languages[$tag_index]}" ]] && cmd+=("-metadata:s:a:$output_audio_index" "language=${tag_languages[$tag_index]}")
+      fi
+    done
   done
 
   cmd+=("$output")
@@ -497,6 +599,7 @@ elif [[ "$audio_operation" == "remove" ]]; then
   cmd=(ffmpeg -y -i "$input")
   cmd+=(-map '0:v?' -c:v copy)
 
+  final_audio_sources=()
   output_audio_index=0
   for ((source_index = 0; source_index < audio_count; source_index++)); do
     remove_track=false
@@ -508,12 +611,41 @@ elif [[ "$audio_operation" == "remove" ]]; then
     done
 
     if [[ "$remove_track" == false ]]; then
+      final_audio_sources+=("$source_index")
       cmd+=(-map "0:a:$source_index" "-c:a:$output_audio_index" copy)
       output_audio_index=$((output_audio_index + 1))
     fi
   done
 
+  for ((tag_index = 0; tag_index < ${#tag_track_indexes[@]}; tag_index++)); do
+    tagged_source="${tag_track_indexes[$tag_index]}"
+    for ((output_audio_index = 0; output_audio_index < ${#final_audio_sources[@]}; output_audio_index++)); do
+      if [[ "${final_audio_sources[$output_audio_index]}" == "$tagged_source" ]]; then
+        [[ -n "${tag_titles[$tag_index]}" ]] && cmd+=("-metadata:s:a:$output_audio_index" "title=${tag_titles[$tag_index]}")
+        [[ -n "${tag_languages[$tag_index]}" ]] && cmd+=("-metadata:s:a:$output_audio_index" "language=${tag_languages[$tag_index]}")
+      fi
+    done
+  done
+
   cmd+=(-map '0:s?' -c:s copy)
+  cmd+=("$output")
+elif ((${#tag_specs[@]} > 0)); then
+  OUTPUT_FILE_SUFFIX="Audio_Tagged"
+  output="${base}_${OUTPUT_FILE_SUFFIX}.${ext}"
+
+  cmd=(ffmpeg -y -i "$input")
+  cmd+=(-map '0:v?' -c:v copy -map '0:a?' -map '0:s?' -c:s copy)
+
+  for ((output_audio_index = 0; output_audio_index < audio_count; output_audio_index++)); do
+    cmd+=("-c:a:$output_audio_index" copy)
+  done
+
+  for ((tag_index = 0; tag_index < ${#tag_track_indexes[@]}; tag_index++)); do
+    tagged_source="${tag_track_indexes[$tag_index]}"
+    [[ -n "${tag_titles[$tag_index]}" ]] && cmd+=("-metadata:s:a:$tagged_source" "title=${tag_titles[$tag_index]}")
+    [[ -n "${tag_languages[$tag_index]}" ]] && cmd+=("-metadata:s:a:$tagged_source" "language=${tag_languages[$tag_index]}")
+  done
+
   cmd+=("$output")
 else
 selected_tracks=()

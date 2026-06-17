@@ -76,6 +76,7 @@ Examples:
 ./drc_encode movie.mkv --tracks 1 --keep-original
 ./drc_encode movie.mkv --reorder-audio 2,4,3,1 --keep-original
 ./drc_encode movie.mkv --remove-audio 2 --keep-original
+./drc_encode movie.mkv --tag-audio 2:title=Commentary --keep-original
 ```
 
 Options:
@@ -85,6 +86,7 @@ Options:
 - `--profile <profile>`: choose the encode profile
 - `--reorder-audio [order]`: reorder existing audio tracks without creating a new DRC track
 - `--remove-audio [list]`: remove existing audio tracks without creating a new DRC track
+- `--tag-audio <spec>`: rewrite existing audio metadata without creating a new DRC track
 - `--keep-original`: keep the original input file after a successful encode
 - `[language-code]`: optional legacy override for the generated track language metadata
 
@@ -181,6 +183,25 @@ If you omit the list, the script displays the detected audio tracks and prompts 
 ```
 
 The script will not allow removing every audio track.
+
+Use `--tag-audio` to rewrite audio metadata by displayed track number:
+
+```bash
+./drc_encode movie.mkv --tag-audio 2:title=Commentary --keep-original
+./drc_encode movie.mkv --tag-audio 2:language=eng --keep-original
+./drc_encode movie.mkv --tag-audio 2:title=Commentary,language=eng --keep-original
+```
+
+You can repeat `--tag-audio` for multiple tracks:
+
+```bash
+./drc_encode movie.mkv \
+  --tag-audio 1:title=Main_Audio \
+  --tag-audio 2:title=Commentary \
+  --keep-original
+```
+
+`--tag-audio` can also be combined with `--reorder-audio` or `--remove-audio`. The track number in the tag spec always refers to the original displayed audio track number from the input file.
 
 ## Batch Usage
 
